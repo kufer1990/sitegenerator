@@ -1,0 +1,27 @@
+{
+  "site": "https://powiedzto.eu",
+  "scannedAt": "2026-03-12T07:27:36.382Z",
+  "pagesCount": 1,
+  "maxPages": 100,
+  "usedSitemap": false,
+  "robots": {
+    "url": "https://powiedzto.eu/robots.txt",
+    "hasContent": true,
+    "sitemaps": [
+      "https://powiedzto.pl/sitemap.xml"
+    ]
+  },
+  "sitemapSources": [
+    {
+      "sitemapUrl": "https://powiedzto.eu/sitemap.xml",
+      "entriesCount": 2
+    }
+  ],
+  "pages": [
+    {
+      "url": "https://powiedzto.eu/",
+      "status": "ok",
+      "discoveredLinks": []
+    }
+  ]
+}
