@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "crawl": "tsx src/crawl.ts"
+    "crawl": "tsx src/crawl.ts",
+    "extract-pages": "tsx src/extract-page-data.ts"
   },
   "dependencies": {
     "axios": "^1.8.4",
