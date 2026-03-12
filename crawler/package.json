@@ -5,8 +5,8 @@
   "scripts": {
     "stage1": "tsx src/crawl.ts",
     "stage2": "tsx src/extract-page-data.ts",
-    "stage2.5": "tsx src/validate-site-structure.ts",
-    "stage3": "tsx src/run-stage-03-analysis.ts"
+    "stage3": "tsx src/validate-site-structure.ts",
+    "stage4": "tsx src/run-stage-04-analysis.ts"
   },
   "dependencies": {
     "axios": "^1.8.4",
