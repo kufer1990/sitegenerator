@@ -21,11 +21,42 @@ type PageType =
   | "product"
   | "article"
   | "legal"
+  | "app"
+  | "help"
   | "unknown";
 
 type SocialLink = {
   platform: string;
   url: string;
+};
+
+type ContentSource = "main" | "article" | "role-main" | "body-fallback" | "empty";
+
+type ImageAsset = {
+  src: string;
+  absoluteUrl: string;
+  alt: string | null;
+  title: string | null;
+  width: number | null;
+  height: number | null;
+  sourceType: "img-src" | "img-srcset" | "data-src" | "background-image";
+  kind: "logo" | "hero" | "content" | "icon" | "unknown";
+};
+
+type ContentSection = {
+  heading: string | null;
+  text: string;
+  tag: string;
+  index: number;
+};
+
+type ContentFlags = {
+  hasMainContent: boolean;
+  hasH1: boolean;
+  hasImages: boolean;
+  hasStructuredData: boolean;
+  hasCanonical: boolean;
+  isThinContent: boolean;
 };
 
 type PageTypeClassification = {
@@ -57,17 +88,23 @@ type ExtractedPageData = {
   h2: string[];
   rawText: string;
   mainContentText: string;
+  contentSource: ContentSource;
   bodyTextLength: number;
   wordCount: number;
   mainContentWordCount: number;
   internalLinks: string[];
+  normalizedInternalLinks: string[];
   externalLinks: string[];
+  images: ImageAsset[];
+  imageCount: number;
+  sections: ContentSection[];
   buttons: string[];
   formsCount: number;
   emails: string[];
   phones: string[];
   socialLinks: SocialLink[];
   structuredData: unknown[];
+  contentFlags: ContentFlags;
   pageType: PageType;
   pageTypeConfidence: number;
   pageTypeReason: string | null;
@@ -88,20 +125,23 @@ type RedirectInfo = {
   redirectChain: string[];
 };
 
+type MainContentExtraction = {
+  text: string;
+  source: ContentSource;
+};
+
 const SOURCE_FILE_REL = "output/01-crawl.json";
 const OUTPUT_FILE_REL = "output/02-page-data.json";
 const REQUEST_DELAY_MS = Number(process.env.EXTRACT_DELAY_MS || 200);
 const REQUEST_TIMEOUT_MS = Number(process.env.EXTRACT_TIMEOUT_MS || 15000);
 
-const MAIN_CONTENT_SELECTORS = [
-  "main",
-  "article",
-  '[role="main"]',
-  "#main",
-  ".main-content",
-  "#content",
-  ".content",
+const MAIN_CONTENT_SELECTORS: Array<{ selector: string; source: ContentSource }> = [
+  { selector: "main", source: "main" },
+  { selector: "article", source: "article" },
+  { selector: '[role="main"]', source: "role-main" },
 ];
+
+const MAIN_CONTENT_FALLBACK_SELECTORS = ["#main", ".main-content", "#content", ".content"];
 
 const SOCIAL_DOMAINS: Array<{ platform: string; domain: string }> = [
   { platform: "facebook", domain: "facebook.com" },
@@ -127,6 +167,20 @@ const TECHNICAL_TEXT_PATTERNS: RegExp[] = [
   /hydration/i,
   /metadata stream/i,
   /__webpack_require__/i,
+  /react\.fragment/i,
+  /parallelrouterkey/i,
+  /dangerouslysetinnerhtml/i,
+  /className\\":/i,
+  /aria-label\\":/i,
+];
+
+const CTA_NOISE_PATTERNS: RegExp[] = [
+  /^toggle navigation$/i,
+  /^menu$/i,
+  /^close$/i,
+  /^open$/i,
+  /^krok\s+\d+$/i,
+  /^zwrot$/i,
 ];
 
 const TECHNICAL_REMOVE_SELECTOR = [
@@ -179,6 +233,35 @@ function normalizeUrl(input: string, baseUrl?: string): string | null {
   } catch {
     return null;
   }
+}
+
+function normalizeInternalLink(url: string): string | null {
+  const normalized = normalizeUrl(url);
+  if (!normalized) return null;
+
+  try {
+    const parsed = new URL(normalized);
+    parsed.hostname = normalizeHostname(parsed.hostname);
+    return parsed.href;
+  } catch {
+    return null;
+  }
+}
+
+function parseDimension(value: string | undefined): number | null {
+  if (!value) return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return parsed;
+}
+
+function decodeBasicEscapes(value: string): string {
+  return value
+    .replace(/\\u003c/gi, "<")
+    .replace(/\\u003e/gi, ">")
+    .replace(/\\u0026/gi, "&")
+    .replace(/\\n/g, "\n")
+    .replace(/\\"/g, '"');
 }
 
 function getWordCount(text: string): number {
@@ -302,30 +385,110 @@ function extractTextFromSelection(
   return normalizeTextBlocks(clone.text());
 }
 
-function extractRawText($: cheerio.CheerioAPI): string {
-  const root = $("body").length ? $("body") : $.root();
-  return extractTextFromSelection($, root);
+function extractFrameworkPayloadText($: cheerio.CheerioAPI): string {
+  const values = new Set<string>();
+
+  $("script").each((_: number, element) => {
+    const type = ($(element).attr("type") || "").toLowerCase();
+    if (type === "application/ld+json") return;
+
+    const rawScript = $(element).html() || "";
+    if (!rawScript) return;
+    if (!/__next_f|__next_data__|children|parallelrouterkey|dangerouslysetinnerhtml/i.test(rawScript)) {
+      return;
+    }
+
+    const decoded = decodeBasicEscapes(rawScript);
+    const quoted = decoded.match(/"([^"\\]{2,220})"/g) || [];
+
+    for (const entry of quoted) {
+      const candidate = cleanText(entry.slice(1, -1));
+      if (!candidate) continue;
+      if (candidate.length < 3 || candidate.length > 220) continue;
+      if (isTechnicalTextSegment(candidate)) continue;
+      if (
+        /(https?:\/\/|\/_next\/|static\/chunks\/|className|parallelRouterKey|dangerouslySetInnerHTML|next-error-h1|applicationCategory|priceCurrency|prefers-color-scheme)/i.test(
+          candidate,
+        )
+      ) {
+        continue;
+      }
+
+      const words = getWordCount(candidate);
+      if (words < 2 && !/[.!?]/.test(candidate)) continue;
+      if (/^[a-z0-9_-]+$/i.test(candidate) && candidate.length < 18) continue;
+
+      values.add(candidate);
+    }
+  });
+
+  return [...values].join("\n\n");
 }
 
-function extractMainContentText($: cheerio.CheerioAPI, fallbackText: string): string {
-  const candidates: Array<{ text: string; words: number }> = [];
+function extractRawText($: cheerio.CheerioAPI): string {
+  const root = $("body").length ? $("body") : $.root();
+  const extracted = extractTextFromSelection($, root);
+  if (getWordCount(extracted) >= 20) {
+    return extracted;
+  }
 
-  for (const selector of MAIN_CONTENT_SELECTORS) {
+  const payloadText = extractFrameworkPayloadText($);
+  if (getWordCount(payloadText) > getWordCount(extracted)) {
+    return payloadText;
+  }
+
+  if (extracted && payloadText) {
+    return normalizeTextBlocks(`${extracted}\n${payloadText}`);
+  }
+
+  return extracted || payloadText;
+}
+
+function extractMainContent(
+  $: cheerio.CheerioAPI,
+  fallbackText: string,
+): MainContentExtraction {
+  const candidates: Array<{ text: string; words: number; source: ContentSource }> = [];
+
+  for (const { selector, source } of MAIN_CONTENT_SELECTORS) {
     $(selector).each((_: number, element) => {
       const text = extractTextFromSelection($, $(element));
       const words = getWordCount(text);
       if (words >= 20) {
-        candidates.push({ text, words });
+        candidates.push({ text, words, source });
       }
     });
   }
 
-  if (!candidates.length) {
-    return fallbackText;
+  if (candidates.length) {
+    candidates.sort((a, b) => b.words - a.words);
+    const winner = candidates[0];
+    return { text: winner.text, source: winner.source };
   }
 
-  candidates.sort((a, b) => b.words - a.words);
-  return candidates[0].text;
+  for (const selector of MAIN_CONTENT_FALLBACK_SELECTORS) {
+    let winnerText = "";
+    let winnerWords = 0;
+
+    $(selector).each((_: number, element) => {
+      const text = extractTextFromSelection($, $(element));
+      const words = getWordCount(text);
+      if (words > winnerWords) {
+        winnerText = text;
+        winnerWords = words;
+      }
+    });
+
+    if (winnerWords >= 20) {
+      return { text: winnerText, source: "body-fallback" };
+    }
+  }
+
+  if (getWordCount(fallbackText) >= 20) {
+    return { text: fallbackText, source: "body-fallback" };
+  }
+
+  return { text: "", source: "empty" };
 }
 
 function extractStructuredData($: cheerio.CheerioAPI): unknown[] {
@@ -406,12 +569,364 @@ function extractHeadingList($: cheerio.CheerioAPI, selector: string): string[] {
   return values;
 }
 
+function deriveFallbackHeadings(
+  title: string | null,
+  mainContentText: string,
+  sections: ContentSection[],
+): { h1: string[]; h2: string[] } {
+  const h1Values: string[] = [];
+  const h2Values: string[] = [];
+
+  for (const section of sections) {
+    if (!section.heading) continue;
+    if (h1Values.length === 0) {
+      h1Values.push(section.heading);
+    } else if (!h2Values.includes(section.heading)) {
+      h2Values.push(section.heading);
+    }
+  }
+
+  if (!h1Values.length && title) {
+    const normalizedTitle = cleanText(title)
+      .split("|")[0]
+      .split("-")[0]
+      .trim();
+    if (normalizedTitle) {
+      h1Values.push(normalizedTitle);
+    }
+  }
+
+  if (!h1Values.length && mainContentText) {
+    const firstLine = mainContentText
+      .split(/\n+/)
+      .map(cleanText)
+      .find(line => getWordCount(line) >= 2 && getWordCount(line) <= 12);
+    if (firstLine) {
+      h1Values.push(firstLine);
+    }
+  }
+
+  return { h1: h1Values, h2: h2Values };
+}
+
+function getScopeByContentSource(
+  $: cheerio.CheerioAPI,
+  source: ContentSource,
+): cheerio.Cheerio<any> {
+  if (source === "main") {
+    const node = $("main").first();
+    if (node.length) return node;
+  }
+  if (source === "article") {
+    const node = $("article").first();
+    if (node.length) return node;
+  }
+  if (source === "role-main") {
+    const node = $('[role="main"]').first();
+    if (node.length) return node;
+  }
+
+  const body = $("body").first();
+  if (body.length) return body;
+  return $.root();
+}
+
+function extractSections(
+  $: cheerio.CheerioAPI,
+  source: ContentSource,
+  mainContentText: string,
+): ContentSection[] {
+  const sections: ContentSection[] = [];
+  const seen = new Set<string>();
+  const scope = getScopeByContentSource($, source);
+
+  scope.find("section, article").each((_: number, element) => {
+    const sectionNode = $(element);
+    const heading = cleanText(sectionNode.find("h1, h2, h3").first().text()) || null;
+    const text = extractTextFromSelection($, sectionNode);
+    if (getWordCount(text) < 10) return;
+
+    const key = `${heading || ""}::${text.slice(0, 280).toLowerCase()}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+
+    sections.push({
+      heading,
+      text,
+      tag: element.tagName || "section",
+      index: sections.length,
+    });
+  });
+
+  if (sections.length < 2) {
+    scope.find("h1, h2, h3").each((_: number, element) => {
+      const heading = cleanText($(element).text());
+      if (!heading) return;
+      if (isTechnicalTextSegment(heading)) return;
+
+      const parts: string[] = [];
+      let sibling = $(element).next();
+      let guard = 0;
+
+      while (sibling.length && guard < 8) {
+        const tag = sibling.get(0)?.tagName || "";
+        if (/^h[1-3]$/i.test(tag)) break;
+        const piece = cleanText(sibling.text());
+        if (piece && !isTechnicalTextSegment(piece)) {
+          parts.push(piece);
+        }
+        sibling = sibling.next();
+        guard += 1;
+      }
+
+      const text = normalizeTextBlocks(parts.join("\n"));
+      if (getWordCount(text) < 8) return;
+
+      const key = `${heading}::${text.slice(0, 220).toLowerCase()}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+
+      sections.push({
+        heading,
+        text,
+        tag: element.tagName || "h2",
+        index: sections.length,
+      });
+    });
+  }
+
+  if (!sections.length && mainContentText) {
+    const parts = mainContentText
+      .split(/\n{2,}/)
+      .map(cleanText)
+      .filter(part => getWordCount(part) >= 6);
+
+    for (const part of parts.slice(0, 20)) {
+      sections.push({
+        heading: null,
+        text: part,
+        tag: "p",
+        index: sections.length,
+      });
+    }
+  }
+
+  return sections.map((section, index) => ({ ...section, index }));
+}
+
+function parseSrcsetCandidates(srcsetValue: string): string[] {
+  return srcsetValue
+    .split(",")
+    .map(part => cleanText(part).split(" ")[0])
+    .filter(Boolean);
+}
+
+function extractBackgroundImageUrls(styleValue: string): string[] {
+  const values: string[] = [];
+  const regex = /background-image\s*:\s*url\((['"]?)(.*?)\1\)/gi;
+  let match = regex.exec(styleValue);
+  while (match) {
+    const candidate = cleanText(match[2] || "");
+    if (candidate) values.push(candidate);
+    match = regex.exec(styleValue);
+  }
+  return values;
+}
+
+function inferImageKind(input: {
+  absoluteUrl: string;
+  alt: string | null;
+  title: string | null;
+  className: string;
+  id: string;
+  width: number | null;
+  height: number | null;
+  sourceType: ImageAsset["sourceType"];
+  index: number;
+}): ImageAsset["kind"] {
+  const context = cleanText(
+    `${input.absoluteUrl} ${input.alt || ""} ${input.title || ""} ${input.className} ${input.id}`,
+  ).toLowerCase();
+
+  if (/logo|brand/.test(context)) return "logo";
+
+  if (
+    /icon|favicon|sprite/.test(context) ||
+    ((input.width || 0) > 0 &&
+      (input.height || 0) > 0 &&
+      (input.width || 0) <= 64 &&
+      (input.height || 0) <= 64)
+  ) {
+    return "icon";
+  }
+
+  if (
+    /hero|banner|cover|masthead/.test(context) ||
+    (input.index <= 2 &&
+      (((input.width || 0) >= 900 && (input.height || 0) >= 250) ||
+        ((input.width || 0) >= 1200 || (input.height || 0) >= 500)))
+  ) {
+    return "hero";
+  }
+
+  if (input.sourceType === "img-src" || input.sourceType === "img-srcset") {
+    return "content";
+  }
+
+  return "unknown";
+}
+
+function extractImages($: cheerio.CheerioAPI, pageUrl: string): ImageAsset[] {
+  const seen = new Set<string>();
+  const images: ImageAsset[] = [];
+
+  const pushImage = (payload: {
+    src: string;
+    absoluteUrl: string;
+    alt?: string | null;
+    title?: string | null;
+    width?: number | null;
+    height?: number | null;
+    sourceType: ImageAsset["sourceType"];
+    className?: string;
+    id?: string;
+  }) => {
+    const key = `${payload.absoluteUrl}::${payload.sourceType}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+
+    images.push({
+      src: payload.src,
+      absoluteUrl: payload.absoluteUrl,
+      alt: payload.alt || null,
+      title: payload.title || null,
+      width: payload.width ?? null,
+      height: payload.height ?? null,
+      sourceType: payload.sourceType,
+      kind: inferImageKind({
+        absoluteUrl: payload.absoluteUrl,
+        alt: payload.alt || null,
+        title: payload.title || null,
+        className: payload.className || "",
+        id: payload.id || "",
+        width: payload.width ?? null,
+        height: payload.height ?? null,
+        sourceType: payload.sourceType,
+        index: images.length,
+      }),
+    });
+  };
+
+  $("img").each((_: number, element) => {
+    const node = $(element);
+    const alt = cleanText(node.attr("alt") || "") || null;
+    const title = cleanText(node.attr("title") || "") || null;
+    const width = parseDimension(node.attr("width"));
+    const height = parseDimension(node.attr("height"));
+    const className = node.attr("class") || "";
+    const id = node.attr("id") || "";
+
+    const directSources: Array<{ attr: string; sourceType: ImageAsset["sourceType"] }> = [
+      { attr: "src", sourceType: "img-src" },
+      { attr: "data-src", sourceType: "data-src" },
+      { attr: "data-lazy-src", sourceType: "data-src" },
+      { attr: "data-original", sourceType: "data-src" },
+    ];
+
+    for (const direct of directSources) {
+      const raw = cleanText(node.attr(direct.attr) || "");
+      if (!raw || /^data:/i.test(raw)) continue;
+      const absolute = normalizeUrl(raw, pageUrl);
+      if (!absolute) continue;
+
+      pushImage({
+        src: raw,
+        absoluteUrl: absolute,
+        alt,
+        title,
+        width,
+        height,
+        sourceType: direct.sourceType,
+        className,
+        id,
+      });
+    }
+
+    const srcsetAttributes = ["srcset", "data-srcset", "data-lazy-srcset"];
+    for (const attr of srcsetAttributes) {
+      const rawSrcset = node.attr(attr);
+      if (!rawSrcset) continue;
+
+      for (const candidate of parseSrcsetCandidates(rawSrcset)) {
+        if (!candidate || /^data:/i.test(candidate)) continue;
+        const absolute = normalizeUrl(candidate, pageUrl);
+        if (!absolute) continue;
+
+        pushImage({
+          src: candidate,
+          absoluteUrl: absolute,
+          alt,
+          title,
+          width,
+          height,
+          sourceType: "img-srcset",
+          className,
+          id,
+        });
+      }
+    }
+  });
+
+  $("source[srcset]").each((_: number, element) => {
+    const rawSrcset = $(element).attr("srcset");
+    if (!rawSrcset) return;
+    for (const candidate of parseSrcsetCandidates(rawSrcset)) {
+      if (!candidate || /^data:/i.test(candidate)) continue;
+      const absolute = normalizeUrl(candidate, pageUrl);
+      if (!absolute) continue;
+
+      pushImage({
+        src: candidate,
+        absoluteUrl: absolute,
+        sourceType: "img-srcset",
+        className: $(element).attr("class") || "",
+        id: $(element).attr("id") || "",
+      });
+    }
+  });
+
+  $("[style*='background-image']").each((_: number, element) => {
+    const style = $(element).attr("style") || "";
+    for (const candidate of extractBackgroundImageUrls(style)) {
+      if (!candidate || /^data:/i.test(candidate)) continue;
+      const absolute = normalizeUrl(candidate, pageUrl);
+      if (!absolute) continue;
+
+      pushImage({
+        src: candidate,
+        absoluteUrl: absolute,
+        sourceType: "background-image",
+        className: $(element).attr("class") || "",
+        id: $(element).attr("id") || "",
+        title: cleanText($(element).attr("title") || "") || null,
+      });
+    }
+  });
+
+  return images;
+}
+
 function collectLinks(
   $: cheerio.CheerioAPI,
   pageUrl: string,
   rootHostname: string,
-): { internalLinks: string[]; externalLinks: string[] } {
+): {
+  internalLinks: string[];
+  normalizedInternalLinks: string[];
+  externalLinks: string[];
+} {
   const internalLinks = new Set<string>();
+  const normalizedInternalLinks = new Set<string>();
   const externalLinks = new Set<string>();
 
   $("a[href], area[href]").each((_: number, element) => {
@@ -424,6 +939,10 @@ function collectLinks(
 
     if (isInternalUrl(normalized, rootHostname)) {
       internalLinks.add(normalized);
+      const normalizedInternal = normalizeInternalLink(normalized);
+      if (normalizedInternal) {
+        normalizedInternalLinks.add(normalizedInternal);
+      }
     } else {
       externalLinks.add(normalized);
     }
@@ -431,6 +950,7 @@ function collectLinks(
 
   return {
     internalLinks: [...internalLinks],
+    normalizedInternalLinks: [...normalizedInternalLinks],
     externalLinks: [...externalLinks],
   };
 }
@@ -444,33 +964,51 @@ function isLikelyCtaText(text: string): boolean {
   );
 }
 
+function normalizeButtonLabel(raw: string): string {
+  let value = cleanText(raw);
+  value = value.replace(/\s{2,}/g, " ");
+  value = value.replace(/[|<>]+/g, " ");
+  value = cleanText(value);
+  return value;
+}
+
+function isButtonNoise(label: string): boolean {
+  if (!label) return true;
+  if (label.length > 90) return true;
+  if (isTechnicalTextSegment(label)) return true;
+  if (CTA_NOISE_PATTERNS.some(pattern => pattern.test(label))) return true;
+  if (/^[\W_]+$/.test(label)) return true;
+  return false;
+}
+
 function extractButtons($: cheerio.CheerioAPI): string[] {
-  const values = new Set<string>();
+  const values = new Map<string, string>();
 
   $("button, input[type='button'], input[type='submit']").each(
     (_: number, element) => {
-      const text = cleanText(
+      const text = normalizeButtonLabel(
         $(element).text() || $(element).attr("value") || $(element).attr("aria-label") || "",
       );
-      if (text) values.add(text);
+      if (isButtonNoise(text)) return;
+      values.set(text.toLowerCase(), text);
     },
   );
 
   $("a[href]").each((_: number, element) => {
     const className = ($(element).attr("class") || "").toLowerCase();
     const role = ($(element).attr("role") || "").toLowerCase();
-    const label = cleanText($(element).text() || $(element).attr("aria-label") || "");
+    const label = normalizeButtonLabel($(element).text() || $(element).attr("aria-label") || "");
 
     const ctaByClass = /(btn|button|cta)/i.test(className);
     const ctaByRole = role === "button";
     const ctaByText = label ? isLikelyCtaText(label) : false;
 
-    if ((ctaByClass || ctaByRole || ctaByText) && label) {
-      values.add(label);
+    if ((ctaByClass || ctaByRole || ctaByText) && label && !isButtonNoise(label)) {
+      values.set(label.toLowerCase(), label);
     }
   });
 
-  return [...values];
+  return [...values.values()];
 }
 
 function extractEmails($: cheerio.CheerioAPI, text: string): string[] {
@@ -562,58 +1100,67 @@ function classifyPageType(
 ): PageTypeClassification {
   const parsed = new URL(finalUrl);
   const pathValue = parsed.pathname.toLowerCase();
-  const headingContext = `${title} ${h1.join(" ")}`.toLowerCase();
+  const headingContext = cleanText(`${title} ${h1.join(" ")}`).toLowerCase();
   const mainContext = mainContentText.toLowerCase();
+  const context = `${headingContext} ${mainContext}`;
 
   const scores = new Map<PageType, number>();
   const reasons = new Map<PageType, string[]>();
 
-  if (pathValue === "/") {
-    addTypeSignal(scores, reasons, "homepage", 1, "finalUrl path is root");
+  if (pathValue === "/" || /^\/?(home|start)?$/.test(pathValue)) {
+    addTypeSignal(scores, reasons, "homepage", 1.1, "finalUrl path indicates homepage");
+  }
+
+  if (/komunikator|app|panel|dashboard|generator|narzedzie|tool/.test(pathValue)) {
+    addTypeSignal(scores, reasons, "app", 1.05, "url contains app keyword");
+  }
+  if (/komunikator|uruchom aplikacje|szybki powiedzto|wpisz tekst/.test(context)) {
+    addTypeSignal(scores, reasons, "app", 0.7, "title/h1/content indicates app view");
+  }
+
+  if (/instrukcja|faq|pomoc|help|jak korzystac|guide|manual/.test(pathValue)) {
+    addTypeSignal(scores, reasons, "help", 1, "url contains help keyword");
+  }
+  if (/instrukcja|faq|najczestsze pytania|jak korzystac|poradnik/.test(context)) {
+    addTypeSignal(scores, reasons, "help", 0.75, "title/h1/content indicates help");
   }
 
   if (/kontakt|contact|skontaktuj|dojazd|napisz|telefon/.test(pathValue)) {
-    addTypeSignal(scores, reasons, "contact", 0.9, "url contains contact keyword");
+    addTypeSignal(scores, reasons, "contact", 0.95, "url contains contact keyword");
   }
-  if (/kontakt|contact|skontaktuj/.test(headingContext)) {
-    addTypeSignal(scores, reasons, "contact", 0.7, "title/h1 indicates contact");
-  }
-  if (/kontakt|contact|zadzwo[nn]|napisz/.test(mainContext)) {
-    addTypeSignal(scores, reasons, "contact", 0.45, "main content indicates contact");
+  if (/kontakt|contact|skontaktuj|zadzwo[nn]|napisz/.test(context)) {
+    addTypeSignal(scores, reasons, "contact", 0.65, "title/h1/content indicates contact");
   }
 
   if (/polityka|prywatn|privacy|cookies|regulamin|terms|rodo|legal/.test(pathValue)) {
-    addTypeSignal(scores, reasons, "legal", 0.95, "url contains legal keyword");
+    addTypeSignal(scores, reasons, "legal", 1.05, "url contains legal keyword");
   }
-  if (/privacy policy|polityka prywatno[s]ci|cookies|regulamin/.test(headingContext)) {
-    addTypeSignal(scores, reasons, "legal", 0.75, "title/h1 indicates legal page");
+  if (/privacy policy|polityka prywatno[s]ci|cookies|regulamin/.test(context)) {
+    addTypeSignal(scores, reasons, "legal", 0.75, "title/h1/content indicates legal page");
   }
 
   if (/blog|article|articles|news|aktualnosci|poradnik/.test(pathValue)) {
     addTypeSignal(scores, reasons, "article", 0.85, "url contains article keyword");
   }
-  if (/blog|artykul|aktualno[s]ci/.test(headingContext)) {
-    addTypeSignal(scores, reasons, "article", 0.6, "title/h1 indicates article");
+  if (/blog|artykul|aktualno[s]ci|wpis|czytaj wiecej/.test(context)) {
+    addTypeSignal(scores, reasons, "article", 0.6, "title/h1/content indicates article");
   }
 
   if (/produkt|product|shop|sklep|cennik|pricing|offer/.test(pathValue)) {
     addTypeSignal(scores, reasons, "product", 0.8, "url contains product keyword");
   }
-  if (/produkt|cennik|pricing|offer/.test(headingContext)) {
-    addTypeSignal(scores, reasons, "product", 0.55, "title/h1 indicates product");
+  if (/produkt|cennik|pricing|offer|kup|zamow/.test(context)) {
+    addTypeSignal(scores, reasons, "product", 0.55, "title/h1/content indicates product");
   }
 
   if (/uslugi|usluga|services|service|oferta|zabieg/.test(pathValue)) {
     addTypeSignal(scores, reasons, "service", 0.8, "url contains service keyword");
   }
-  if (/uslugi|service|oferta|zabieg/.test(headingContext)) {
-    addTypeSignal(scores, reasons, "service", 0.55, "title/h1 indicates service");
-  }
-  if (/uslugi|service|oferta|zabieg/.test(mainContext)) {
-    addTypeSignal(scores, reasons, "service", 0.35, "main content indicates service");
+  if (/uslugi|service|oferta|zabieg|pakiet/.test(context)) {
+    addTypeSignal(scores, reasons, "service", 0.5, "title/h1/content indicates service");
   }
 
-  if (/404|not found|nie znaleziono/.test(`${pathValue} ${headingContext}`)) {
+  if (/404|not found|nie znaleziono/.test(`${pathValue} ${context}`)) {
     addTypeSignal(scores, reasons, "unknown", 0.9, "content resembles not-found page");
   }
 
@@ -628,9 +1175,7 @@ function classifyPageType(
 
   const [bestType, bestScore] = ranked[0];
   const secondScore = ranked[1]?.[1] || 0;
-  const confidence = Number(
-    Math.max(0.2, Math.min(1, bestScore - secondScore * 0.25)).toFixed(2),
-  );
+  const confidence = Number(Math.max(0.2, Math.min(1, bestScore - secondScore * 0.2)).toFixed(2));
   const reason = (reasons.get(bestType) || []).slice(0, 3).join("; ") || null;
 
   return {
@@ -757,21 +1302,46 @@ function createErrorResult(
     h2: [],
     rawText: "",
     mainContentText: "",
+    contentSource: "empty",
     bodyTextLength: 0,
     wordCount: 0,
     mainContentWordCount: 0,
     internalLinks: [],
+    normalizedInternalLinks: [],
     externalLinks: [],
+    images: [],
+    imageCount: 0,
+    sections: [],
     buttons: [],
     formsCount: 0,
     emails: [],
     phones: [],
     socialLinks: [],
     structuredData: [],
+    contentFlags: {
+      hasMainContent: false,
+      hasH1: false,
+      hasImages: false,
+      hasStructuredData: false,
+      hasCanonical: false,
+      isThinContent: true,
+    },
     pageType: "unknown",
     pageTypeConfidence: 0,
     pageTypeReason: null,
   };
+}
+
+function getStructuredDescription(structuredData: unknown[]): string {
+  for (const item of structuredData) {
+    if (!item || typeof item !== "object") continue;
+    const maybeDescription = (item as { description?: unknown }).description;
+    if (typeof maybeDescription === "string") {
+      const value = cleanText(maybeDescription);
+      if (value) return value;
+    }
+  }
+  return "";
 }
 
 async function processPage(url: string, rootHostname: string): Promise<ExtractedPageData> {
@@ -785,16 +1355,58 @@ async function processPage(url: string, rootHostname: string): Promise<Extracted
 
     const $ = cheerio.load(html);
     const meta = extractMetaFields($, finalUrl);
-    const h1 = extractHeadingList($, "h1");
-    const h2 = extractHeadingList($, "h2");
-    const rawText = extractRawText($);
-    const mainContentText = extractMainContentText($, rawText);
+    const structuredData = extractStructuredData($);
+
+    let rawText = extractRawText($);
+    const mainExtraction = extractMainContent($, rawText);
+    let mainContentText = mainExtraction.text;
+    let contentSource: ContentSource = mainExtraction.source;
+
+    if (!rawText && mainContentText) {
+      rawText = mainContentText;
+    }
+
+    if (!rawText) {
+      rawText =
+        meta.metaDescription ||
+        getStructuredDescription(structuredData) ||
+        cleanText(meta.title || "");
+    }
+
+    if (!mainContentText && rawText) {
+      mainContentText = rawText;
+      contentSource = "body-fallback";
+    }
+
+    if (!mainContentText && !rawText) {
+      contentSource = "empty";
+    }
+
+    const sections = extractSections($, contentSource, mainContentText);
+    let h1 = extractHeadingList($, "h1");
+    let h2 = extractHeadingList($, "h2");
+
+    if (!h1.length || !h2.length) {
+      const fallbackHeadings = deriveFallbackHeadings(meta.title, mainContentText, sections);
+      if (!h1.length && fallbackHeadings.h1.length) {
+        h1 = fallbackHeadings.h1;
+      }
+      if (!h2.length && fallbackHeadings.h2.length) {
+        h2 = fallbackHeadings.h2;
+      }
+    }
+
     const bodyTextLength = rawText.length;
     const wordCount = getWordCount(rawText);
     const mainContentWordCount = getWordCount(mainContentText);
-    const structuredData = extractStructuredData($);
 
-    const { internalLinks, externalLinks } = collectLinks($, finalUrl, rootHostname);
+    const { internalLinks, normalizedInternalLinks, externalLinks } = collectLinks(
+      $,
+      finalUrl,
+      rootHostname,
+    );
+    const images = extractImages($, finalUrl);
+    const imageCount = images.length;
     const buttons = extractButtons($);
     const formsCount = $("form").length;
     const emails = extractEmails($, `${rawText}\n${mainContentText}`);
@@ -807,6 +1419,15 @@ async function processPage(url: string, rootHostname: string): Promise<Extracted
       h1,
       mainContentText,
     );
+
+    const contentFlags: ContentFlags = {
+      hasMainContent: mainContentWordCount > 0,
+      hasH1: h1.length > 0,
+      hasImages: imageCount > 0,
+      hasStructuredData: structuredData.length > 0,
+      hasCanonical: Boolean(meta.canonical),
+      isThinContent: mainContentWordCount > 0 ? mainContentWordCount < 60 : wordCount < 60,
+    };
 
     return {
       url,
@@ -831,17 +1452,23 @@ async function processPage(url: string, rootHostname: string): Promise<Extracted
       h2,
       rawText,
       mainContentText,
+      contentSource,
       bodyTextLength,
       wordCount,
       mainContentWordCount,
       internalLinks,
+      normalizedInternalLinks,
       externalLinks,
+      images,
+      imageCount,
+      sections,
       buttons,
       formsCount,
       emails,
       phones,
       socialLinks,
       structuredData,
+      contentFlags,
       pageType: classification.pageType,
       pageTypeConfidence: classification.pageTypeConfidence,
       pageTypeReason: classification.pageTypeReason,

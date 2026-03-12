@@ -69,12 +69,41 @@ function requireEnv(name: string): string {
   return value;
 }
 
+function parseBooleanEnv(name: string, fallback: boolean): boolean {
+  const value = process.env[name];
+  if (!value) return fallback;
+
+  const normalized = value.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes";
+}
+
 const SITE_URL = requireEnv("SITE_URL");
 const MAX_PAGES = Number(process.env.MAX_PAGES || 100);
 const CRAWL_DELAY_MS = Number(process.env.CRAWL_DELAY_MS || 150);
 const SCRIPT_SCAN_MAX_PER_PAGE = Number(
   process.env.SCRIPT_SCAN_MAX_PER_PAGE || 15,
 );
+const INCLUDE_WORDPRESS_API = parseBooleanEnv("INCLUDE_WORDPRESS_API", false);
+const ALWAYS_EXCLUDED_URL_PATTERNS: RegExp[] = [
+  /^\/wp-admin(?:\/|$)/i,
+  /^\/wp-login\.php(?:$|\?)/i,
+  /^\/xmlrpc\.php(?:$|\?)/i,
+  /^\/wp-cron\.php(?:$|\?)/i,
+  /^\/wp-comments-post\.php(?:$|\?)/i,
+  /^\/wp-trackback\.php(?:$|\?)/i,
+  /^\/wlwmanifest\.xml(?:$|\?)/i,
+  /\/comments\/feed(?:\/|$)/i,
+  /\/feed(?:\/|$)/i,
+  /^\/author\/[^/]+(?:\/|$)/i,
+  /^\/category\/[^/]+\/feed(?:\/|$)/i,
+  /^\/tag\/[^/]+\/feed(?:\/|$)/i,
+  /^\/wp-content\/plugins\/(?:elementor|elementor-pro)(?:\/|$)/i,
+  /^\/me(?:\/|$)/i,
+];
+const WORDPRESS_API_EXCLUDED_URL_PATTERNS: RegExp[] = [
+  /^\/wp-json(?:\/|$)/i,
+  /^\/wp-json\/oembed\/1\.0\/embed(?:$|\?)/i,
+];
 
 const startUrl = new URL(SITE_URL);
 const ORIGIN = startUrl.origin;
@@ -127,6 +156,37 @@ function isSameDomain(url: string): boolean {
   }
 }
 
+function isExcludedUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    const pathname = parsed.pathname.toLowerCase();
+    const pathWithQuery = `${pathname}${parsed.search}`.toLowerCase();
+    const activePatterns = INCLUDE_WORDPRESS_API
+      ? ALWAYS_EXCLUDED_URL_PATTERNS
+      : [...ALWAYS_EXCLUDED_URL_PATTERNS, ...WORDPRESS_API_EXCLUDED_URL_PATTERNS];
+
+    if (activePatterns.some(pattern => pattern.test(pathname))) {
+      return true;
+    }
+
+    if (activePatterns.some(pattern => pattern.test(pathWithQuery))) {
+      return true;
+    }
+
+    if (!INCLUDE_WORDPRESS_API && parsed.searchParams.has("rest_route")) {
+      return true;
+    }
+
+    if (pathname === "/" && parsed.searchParams.has("s")) {
+      return true;
+    }
+
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 function shouldSkipUrl(url: string): boolean {
   const trimmedUrl = url.trim();
 
@@ -146,12 +206,16 @@ function shouldSkipUrl(url: string): boolean {
     const parsed = new URL(absolute);
     const pathname = parsed.pathname.toLowerCase();
 
+    if (isExcludedUrl(parsed.href)) {
+      return true;
+    }
+
     if (pathname.startsWith("/_next/") || pathname.startsWith("/api/")) {
       return true;
     }
 
     if (
-      /\.(jpg|jpeg|png|gif|svg|webp|pdf|zip|rar|doc|docx|xls|xlsx|mp4|mp3|woff|woff2|ttf|eot|css|js|map|xml|txt|webmanifest|ico)$/i.test(
+      /\.(jpg|jpeg|png|gif|svg|webp|pdf|zip|rar|doc|docx|xls|xlsx|mp4|mp3|woff|woff2|ttf|eot|css|js|map|xml|json|txt|webmanifest|ico)$/i.test(
         pathname,
       )
     ) {
@@ -440,10 +504,25 @@ const rejectedUrls: Array<{ url: string; reason: string }> = [];
 
         for (const nestedUrl of nestedEntries) {
           if (!isSameDomain(nestedUrl)) continue;
+          if (isExcludedUrl(nestedUrl)) {
+            rejectedUrls.push({
+              url: nestedUrl,
+              reason: "excluded-pattern",
+            });
+            continue;
+          }
           const normalized = normalizeUrl(nestedUrl);
           if (normalized) discoveredUrls.add(normalized);
         }
       } else {
+      if (isExcludedUrl(entry)) {
+  rejectedUrls.push({
+    url: entry,
+    reason: "excluded-pattern",
+  });
+  continue;
+}
+
       if (!isSameDomain(entry)) {
   rejectedUrls.push({
     url: entry,
@@ -488,6 +567,7 @@ async function crawlFromHomepage(
     if (!currentUrl) continue;
     if (visited.has(currentUrl)) continue;
     if (!isSameDomain(currentUrl)) continue;
+    if (shouldSkipUrl(currentUrl)) continue;
 
     visited.add(currentUrl);
 
