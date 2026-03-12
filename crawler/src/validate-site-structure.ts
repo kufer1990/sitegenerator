@@ -1,5 +1,5 @@
-import fs from "node:fs/promises";
-import path from "node:path";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 
 type Stage2PageType =
   | "homepage"
@@ -384,7 +384,7 @@ function detectPageType(page: Stage2Page): DetectPageTypeResult {
     addScore(scores, reasons, "unknown", 0.4, "fallback unknown");
   }
 
-  const ranked = [...scores.entries()].sort((a, b) => b[1] - a[1]);
+  const ranked = Array.from(scores.entries()).sort((a, b) => b[1] - a[1]);
   if (!ranked.length) {
     return {
       pageType: "unknown",
@@ -472,7 +472,7 @@ function detectWordpressSignals(page: Stage2Page): string[] {
     reasons.add("wordpress marker in content");
   }
 
-  return [...reasons];
+  return Array.from(reasons);
 }
 
 function detectUtilitySignals(
@@ -505,7 +505,7 @@ function detectUtilitySignals(
     reasons.add("thin navigation-like page");
   }
 
-  return [...reasons];
+  return Array.from(reasons);
 }
 
 function detectJunkSignals(
@@ -561,7 +561,7 @@ function detectJunkSignals(
     reasons.add("failed page without usable content");
   }
 
-  return [...reasons];
+  return Array.from(reasons);
 }
 
 function inferBusinessValue(
@@ -770,7 +770,7 @@ function getLinkCandidates(page: Stage2Page): string[] {
     }
   }
 
-  return [...deduped.values()];
+  return Array.from(deduped.values());
 }
 
 function pathDepth(url: string): number {

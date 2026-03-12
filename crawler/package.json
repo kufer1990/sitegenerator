@@ -3,9 +3,10 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "crawl": "tsx src/crawl.ts",
-    "extract-pages": "tsx src/extract-page-data.ts",
-    "validate-structure": "tsx src/validate-site-structure.ts"
+    "stage1": "tsx src/crawl.ts",
+    "stage2": "tsx src/extract-page-data.ts",
+    "stage2.5": "tsx src/validate-site-structure.ts",
+    "stage3": "tsx src/run-stage-03-analysis.ts"
   },
   "dependencies": {
     "axios": "^1.8.4",
@@ -14,7 +15,8 @@
     "xml2js": "^0.6.2"
   },
   "devDependencies": {
-    "@types/node": "^22.13.10",
+    "@openai/codex": "^0.114.0",
+    "@types/node": "^22.19.15",
     "@types/xml2js": "^0.4.14",
     "tsx": "^4.19.3",
     "typescript": "^5.8.2"
