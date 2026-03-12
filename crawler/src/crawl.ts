@@ -20,12 +20,16 @@ type SitemapDiscoveryResult = {
     entriesCount: number;
   }>;
   urls: string[];
+  rejectedUrls: Array<{
+    url: string;
+    reason: string;
+  }>;
 };
-
 type CrawlPageResult = {
   url: string;
   status: "ok" | "error";
   discoveredLinks: string[];
+  idLikeLinks: string[];
   error?: string;
 };
 
@@ -35,6 +39,7 @@ type CrawlReport = {
   pagesCount: number;
   maxPages: number;
   usedSitemap: boolean;
+  sitemapUrlsCount: number;
   robots: {
     url: string;
     hasContent: boolean;
@@ -44,16 +49,32 @@ type CrawlReport = {
     sitemapUrl: string;
     entriesCount: number;
   }>;
+  rejectedSitemapUrls: Array<{
+    url: string;
+    reason: string;
+  }>;
   pages: CrawlPageResult[];
 };
 
-const SITE_URL = process.env.SITE_URL;
+type HtmlExtractionResult = {
+  links: string[];
+  scriptUrls: string[];
+};
+
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`Brak ${name} w pliku .env`);
+  }
+  return value;
+}
+
+const SITE_URL = requireEnv("SITE_URL");
 const MAX_PAGES = Number(process.env.MAX_PAGES || 100);
 const CRAWL_DELAY_MS = Number(process.env.CRAWL_DELAY_MS || 150);
-
-if (!SITE_URL) {
-  throw new Error("Brak SITE_URL w pliku .env");
-}
+const SCRIPT_SCAN_MAX_PER_PAGE = Number(
+  process.env.SCRIPT_SCAN_MAX_PER_PAGE || 15,
+);
 
 const startUrl = new URL(SITE_URL);
 const ORIGIN = startUrl.origin;
@@ -95,24 +116,226 @@ function toAbsoluteUrl(href: string, baseUrl: string): string | null {
   }
 }
 
+const START_HOSTNAME = startUrl.hostname.replace(/^www\./, "");
+
 function isSameDomain(url: string): boolean {
   try {
-    return new URL(url).origin === ORIGIN;
+    const hostname = new URL(url).hostname.replace(/^www\./, "");
+    return hostname === START_HOSTNAME;
   } catch {
     return false;
   }
 }
 
 function shouldSkipUrl(url: string): boolean {
-  return (
-    url.startsWith("mailto:") ||
-    url.startsWith("tel:") ||
-    url.startsWith("javascript:") ||
-    url.startsWith("data:") ||
-    /\.(jpg|jpeg|png|gif|svg|webp|pdf|zip|rar|doc|docx|xls|xlsx|mp4|mp3)$/i.test(
-      url,
-    )
-  );
+  const trimmedUrl = url.trim();
+
+  if (
+    trimmedUrl.startsWith("mailto:") ||
+    trimmedUrl.startsWith("tel:") ||
+    trimmedUrl.startsWith("javascript:") ||
+    trimmedUrl.startsWith("data:")
+  ) {
+    return true;
+  }
+
+  const absolute = toAbsoluteUrl(trimmedUrl, ORIGIN);
+  if (!absolute) return true;
+
+  try {
+    const parsed = new URL(absolute);
+    const pathname = parsed.pathname.toLowerCase();
+
+    if (pathname.startsWith("/_next/") || pathname.startsWith("/api/")) {
+      return true;
+    }
+
+    if (
+      /\.(jpg|jpeg|png|gif|svg|webp|pdf|zip|rar|doc|docx|xls|xlsx|mp4|mp3|woff|woff2|ttf|eot|css|js|map|xml|txt|webmanifest|ico)$/i.test(
+        pathname,
+      )
+    ) {
+      return true;
+    }
+
+    return !isLikelyPagePath(pathname);
+  } catch {
+    return true;
+  }
+}
+
+function isLikelyPagePath(pathname: string): boolean {
+  if (!pathname) return false;
+  if (pathname === "/") return true;
+  if (pathname.includes(" ")) return false;
+  if (pathname.includes("\\")) return false;
+  if (pathname.includes("$") || pathname.includes("{") || pathname.includes("}")) {
+    return false;
+  }
+
+  const segments = pathname.split("/").filter(Boolean);
+  if (!segments.length) return true;
+
+  if (segments.every(segment => segment.length === 1)) {
+    return false;
+  }
+
+  return segments.every(segment => /^[a-z0-9\-._~%]+$/i.test(segment));
+}
+
+function cleanExtractedUrl(rawUrl: string): string {
+  return rawUrl
+    .trim()
+    .replace(/^["'`]+|["'`]+$/g, "")
+    .replace(/[\\),.;]+$/g, "");
+}
+
+function addInternalLinkCandidate(
+  rawUrl: string,
+  baseUrl: string,
+  links: Set<string>,
+): void {
+  const cleanedUrl = cleanExtractedUrl(rawUrl);
+  if (!cleanedUrl) return;
+
+  const absolute = toAbsoluteUrl(cleanedUrl, baseUrl);
+  if (!absolute) return;
+  if (!isSameDomain(absolute)) return;
+  if (shouldSkipUrl(absolute)) return;
+
+  const normalized = normalizeUrl(absolute);
+  if (!normalized) return;
+
+  links.add(normalized);
+}
+
+function extractUrlCandidatesFromText(text: string): string[] {
+  const normalizedText = text.replace(/\\\//g, "/");
+  const candidates = new Set<string>();
+
+  const absoluteUrlMatches =
+    normalizedText.match(/https?:\/\/[^\s"'`<>\\)]+/gi) || [];
+  for (const match of absoluteUrlMatches) {
+    candidates.add(match);
+  }
+
+  const relativePathMatches =
+    normalizedText.match(
+      /["'`](\/(?!_next\/|api\/|static\/|assets\/|images\/|img\/|fonts\/|icons\/)[a-z0-9\-._~/%?&=+#:]{1,240})["'`]/gi,
+    ) || [];
+
+  for (const match of relativePathMatches) {
+    candidates.add(match.slice(1, -1));
+  }
+
+  return [...candidates];
+}
+
+function extractInternalLinks(
+  html: string,
+  currentUrl: string,
+): HtmlExtractionResult {
+  const $ = cheerio.load(html);
+  const links = new Set<string>();
+  const scriptUrls = new Set<string>();
+
+  const selectors: Array<{ selector: string; attr: string }> = [
+    { selector: "a[href]", attr: "href" },
+    { selector: "area[href]", attr: "href" },
+    { selector: "link[href]", attr: "href" },
+    { selector: "[data-href]", attr: "data-href" },
+    { selector: "[data-url]", attr: "data-url" },
+    { selector: "[data-link]", attr: "data-link" },
+  ];
+
+  for (const { selector, attr } of selectors) {
+    $(selector).each((_: any, element: any) => {
+      const value = $(element).attr(attr);
+      if (!value) return;
+      addInternalLinkCandidate(value, currentUrl, links);
+    });
+  }
+
+  $("[onclick]").each((_: any, element: any) => {
+    const onclick = $(element).attr("onclick");
+    if (!onclick) return;
+
+    for (const candidate of extractUrlCandidatesFromText(onclick)) {
+      addInternalLinkCandidate(candidate, currentUrl, links);
+    }
+  });
+
+  $("script").each((_: any, element: any) => {
+    const src = $(element).attr("src");
+    if (src) {
+      const absolute = toAbsoluteUrl(src, currentUrl);
+      if (absolute && isSameDomain(absolute)) {
+        try {
+          const pathname = new URL(absolute).pathname.toLowerCase();
+          if (pathname.endsWith(".js")) {
+            scriptUrls.add(absolute);
+          }
+        } catch {
+          return;
+        }
+      }
+      return;
+    }
+
+    const inlineContent = $(element).html() || "";
+    for (const candidate of extractUrlCandidatesFromText(inlineContent)) {
+      addInternalLinkCandidate(candidate, currentUrl, links);
+    }
+  });
+
+  return {
+    links: [...links],
+    scriptUrls: [...scriptUrls],
+  };
+}
+
+async function extractLinksFromScripts(
+  scriptUrls: string[],
+  currentUrl: string,
+  scannedScriptUrls: Set<string>,
+): Promise<string[]> {
+  const links = new Set<string>();
+
+  for (const scriptUrl of scriptUrls.slice(0, SCRIPT_SCAN_MAX_PER_PAGE)) {
+    if (scannedScriptUrls.has(scriptUrl)) continue;
+    scannedScriptUrls.add(scriptUrl);
+
+    try {
+      const scriptText = await fetchText(scriptUrl);
+      for (const candidate of extractUrlCandidatesFromText(scriptText)) {
+        addInternalLinkCandidate(candidate, currentUrl, links);
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return [...links];
+}
+
+function isIdLikeUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+
+    for (const [key] of parsed.searchParams.entries()) {
+      if (key.toLowerCase() === "id" || key.toLowerCase().endsWith("id")) {
+        return true;
+      }
+    }
+
+    if (/\/\d{2,}(?:\/|$)/.test(parsed.pathname)) {
+      return true;
+    }
+
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 async function fetchText(url: string): Promise<string> {
@@ -196,7 +419,8 @@ async function discoverSitemaps(): Promise<SitemapDiscoveryResult> {
     entriesCount: number;
   }> = [];
 
-  const discoveredUrls = new Set<string>();
+ const discoveredUrls = new Set<string>();
+const rejectedUrls: Array<{ url: string; reason: string }> = [];
 
   for (const sitemapUrl of candidateSitemaps) {
     const entries = await parseSitemap(sitemapUrl);
@@ -220,40 +444,35 @@ async function discoverSitemaps(): Promise<SitemapDiscoveryResult> {
           if (normalized) discoveredUrls.add(normalized);
         }
       } else {
-        if (!isSameDomain(entry)) continue;
-        const normalized = normalizeUrl(entry);
-        if (normalized) discoveredUrls.add(normalized);
+      if (!isSameDomain(entry)) {
+  rejectedUrls.push({
+    url: entry,
+    reason: "different-domain",
+  });
+  continue;
+}
+
+const normalized = normalizeUrl(entry);
+
+if (!normalized) {
+  rejectedUrls.push({
+    url: entry,
+    reason: "invalid-url",
+  });
+  continue;
+}
+
+discoveredUrls.add(normalized);
       }
     }
   }
 
-  return {
-    robots,
-    sitemapSources,
-    urls: [...discoveredUrls],
-  };
-}
-
-function extractInternalLinks(html: string, currentUrl: string): string[] {
-  const $ = cheerio.load(html);
-  const links = new Set<string>();
-
-  $("a[href]").each((_: any, element: any) => {
-    const href = $(element).attr("href");
-    if (!href) return;
-    if (shouldSkipUrl(href)) return;
-
-    const absolute = toAbsoluteUrl(href, currentUrl);
-    if (!absolute) return;
-    if (!isSameDomain(absolute)) return;
-
-    const normalized = normalizeUrl(absolute);
-    if (!normalized) return;
-
-    links.add(normalized);
-  });
-
-  return [...links];
+return {
+  robots,
+  sitemapSources,
+  urls: [...discoveredUrls],
+  rejectedUrls,
+};
 }
 
 async function crawlFromHomepage(
@@ -261,6 +480,7 @@ async function crawlFromHomepage(
 ): Promise<CrawlPageResult[]> {
   const queue = [...initialQueue];
   const visited = new Set<string>();
+  const scannedScriptUrls = new Set<string>();
   const results: CrawlPageResult[] = [];
 
   while (queue.length > 0 && visited.size < MAX_PAGES) {
@@ -273,12 +493,22 @@ async function crawlFromHomepage(
 
     try {
       const html = await fetchText(currentUrl);
-      const discoveredLinks = extractInternalLinks(html, currentUrl);
+      const htmlExtraction = extractInternalLinks(html, currentUrl);
+      const scriptDiscoveredLinks = await extractLinksFromScripts(
+        htmlExtraction.scriptUrls,
+        currentUrl,
+        scannedScriptUrls,
+      );
+      const discoveredLinks = [
+        ...new Set([...htmlExtraction.links, ...scriptDiscoveredLinks]),
+      ];
+      const idLikeLinks = discoveredLinks.filter(isIdLikeUrl);
 
       results.push({
         url: currentUrl,
         status: "ok",
         discoveredLinks,
+        idLikeLinks,
       });
 
       for (const link of discoveredLinks) {
@@ -296,6 +526,7 @@ async function crawlFromHomepage(
         url: currentUrl,
         status: "error",
         discoveredLinks: [],
+        idLikeLinks: [],
         error: errorMessage,
       });
 
@@ -311,24 +542,32 @@ async function crawlFromHomepage(
 async function buildReport(): Promise<CrawlReport> {
   const sitemapDiscovery = await discoverSitemaps();
 
-  const seedUrls = sitemapDiscovery.urls.length
-    ? sitemapDiscovery.urls
-    : SITE_URL ? [normalizeUrl(SITE_URL)].filter((url): url is string => Boolean(url)) : [];
+  const homepageSeed = normalizeUrl(SITE_URL);
+  const seedUrls = [
+    ...new Set(
+      [
+        homepageSeed,
+        ...sitemapDiscovery.urls,
+      ].filter((url): url is string => Boolean(url)),
+    ),
+  ];
 
   const pages = await crawlFromHomepage(seedUrls);
 
-  return {
-    site: SITE_URL || ORIGIN,
-    scannedAt: new Date().toISOString(),
-    pagesCount: pages.length,
-    maxPages: MAX_PAGES,
-    usedSitemap: sitemapDiscovery.urls.length > 0,
+return {
+  site: SITE_URL,
+  scannedAt: new Date().toISOString(),
+  pagesCount: pages.length,
+  maxPages: MAX_PAGES,
+  usedSitemap: sitemapDiscovery.urls.length > 0,
+  sitemapUrlsCount: sitemapDiscovery.urls.length,
     robots: {
       url: sitemapDiscovery.robots.url,
       hasContent: Boolean(sitemapDiscovery.robots.content),
       sitemaps: sitemapDiscovery.robots.sitemaps,
     },
     sitemapSources: sitemapDiscovery.sitemapSources,
+    rejectedSitemapUrls: sitemapDiscovery.rejectedUrls,
     pages,
   };
 }
@@ -353,6 +592,12 @@ async function main(): Promise<void> {
   console.log(`- pagesCount: ${report.pagesCount}`);
   console.log(`- usedSitemap: ${report.usedSitemap}`);
   console.log(`- sitemapSources: ${report.sitemapSources.length}`);
+  console.log(
+    `- idLikeLinks: ${report.pages.reduce(
+      (sum, page) => sum + page.idLikeLinks.length,
+      0,
+    )}`,
+  );
 }
 
 main().catch(error => {
