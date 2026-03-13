@@ -1,263 +1,113 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import type { Browser } from "playwright";
 
-import { AUDIT_VIEWPORTS } from "../lib/browser/devices.js";
-import { launchAuditBrowser } from "../lib/browser/playwright.js";
-import { createPageSlug } from "../lib/browser/screenshots.js";
-import { runViewportVisualAudit, type BrowserViewportAudit } from "../lib/browser/visual-audit.js";
+import { buildAuditViewports } from "../lib/browser/devices.js";
+import { collectDomSnapshot, installDomSnapshotRuntime } from "../lib/browser/dom-snapshot.js";
+import { getStage5ConfigFromEnv, toPublicStage5Config } from "../lib/browser/config.js";
+import { normalizePathname, normalizeUrl, toRelativeOutputPath } from "../lib/browser/normalizers.js";
+import { preparePageForAudit } from "../lib/browser/page-prepare.js";
+import { selectVisualAuditPages } from "../lib/browser/page-selection.js";
+import { createAuditContext, createAuditPage, collectLoadTimingSummary, launchAuditBrowser } from "../lib/browser/playwright.js";
+import { buildViewportArtifactPaths, createPageSlug, saveAuditScreenshots, saveRenderedHtml } from "../lib/browser/screenshots.js";
+import { buildVisualAuditMarkdownSummary } from "../lib/browser/summary-report.js";
+import type {
+  AuditNotice,
+  BrowserViewportAudit,
+  DomSnapshotResult,
+  SelectedPage,
+  Stage3Output,
+  Stage5Config,
+  Stage5Output,
+  Stage5OutputPage,
+} from "../lib/browser/types.js";
 
-type BusinessValue = "high" | "medium" | "low";
-type SiteRole =
-  | "homepage"
-  | "discovery"
-  | "detail"
-  | "creator"
-  | "account"
-  | "contact"
-  | "about"
-  | "legal"
-  | "utility"
-  | "unknown";
-type Cluster =
-  | "core"
-  | "discovery"
-  | "content"
-  | "conversion"
-  | "account"
-  | "legal"
-  | "utility"
-  | "unknown";
-type PageType =
-  | "home"
-  | "listing"
-  | "category"
-  | "detail"
-  | "creator"
-  | "search"
-  | "favorites"
-  | "auth"
-  | "legal"
-  | "contact"
-  | "about"
-  | "utility"
-  | "unknown";
-
-type EnrichedPage = {
-  url: string;
-  finalUrl?: string | null;
-  normalizedPath?: string | null;
-  fetchStatus: "ok" | "error";
-  title?: string | null;
-  pageType: PageType;
-  siteRole: SiteRole;
-  cluster: Cluster;
-  businessValue: BusinessValue;
-  shouldAnalyze: boolean;
-  pageTypeConfidence?: number;
-  confidence?: number;
-  parentCandidate?: string | null;
-  reason?: string | null;
-  contentSignals?: {
-    wordCount?: number;
-    mainContentWordCount?: number;
-    imageCount?: number;
-    internalLinksCount?: number;
-  };
-};
-
-type Stage3Output = {
-  sourceFile: string;
-  generatedAt: string;
-  pagesTotal: number;
-  pages: EnrichedPage[];
-};
-
-type SelectedPage = {
-  url: string;
-  finalUrl: string;
-  normalizedPath: string;
-  title: string | null;
-  pageType: PageType;
-  siteRole: SiteRole;
-  cluster: Cluster;
-  businessValue: BusinessValue;
-  selectionReason: string;
-};
-
-type Stage5OutputPage = {
-  url: string;
-  finalUrl: string;
-  title: string | null;
-  normalizedPath: string;
-  pageType: PageType;
-  siteRole: SiteRole;
-  cluster: Cluster;
-  businessValue: BusinessValue;
-  selectionReason: string;
-  audits: Record<string, BrowserViewportAudit>;
-};
-
-type Stage5Output = {
-  generatedAt: string;
-  sourceFile: string;
-  sourceGeneratedAt: string;
-  screenshotsDir: string;
-  pagesAudited: number;
-  auditVariants: number;
-  pages: Stage5OutputPage[];
-};
-
-const SOURCE_FILE_REL = "output/03-enriched-site-data.json";
-const OUTPUT_FILE_REL = "output/05-visual-audit.json";
-const SCREENSHOTS_DIR_REL = "output/screenshots";
-const EXACT_PATHS = ["/", "/create", "/categories", "/top", "/favorites", "/about", "/privacy-policy", "/terms"];
-const MAX_CATEGORY_PAGES = Number(process.env.STAGE5_MAX_CATEGORY_PAGES || 3);
-const MAX_DETAIL_PAGES = Number(process.env.STAGE5_MAX_DETAIL_PAGES || 5);
-const MAX_SELECTED_PAGES = Number(process.env.STAGE5_MAX_PAGES || 0);
-const URL_FILTER = (process.env.STAGE5_URL_FILTER || "").trim().toLowerCase();
-
-function normalizePathname(pathname: string): string {
-  if (!pathname) return "/";
-  const compact = pathname.replace(/\/+/g, "/");
-  const trimmed = compact === "/" ? "/" : compact.replace(/\/+$/, "");
-  return trimmed || "/";
+function pushNotice(target: AuditNotice[], code: string, message: string): void {
+  if (!target.some(item => item.code === code && item.message === message)) {
+    target.push({ code, message });
+  }
 }
 
-function normalizeUrl(url: string): string {
-  const parsed = new URL(url);
-  parsed.hash = "";
-  parsed.pathname = normalizePathname(parsed.pathname);
-  return parsed.href;
-}
-
-function getFinalUrl(page: EnrichedPage): string {
-  return page.finalUrl || page.url;
-}
-
-function getNormalizedPath(page: EnrichedPage): string {
-  if (page.normalizedPath) return normalizePathname(page.normalizedPath);
-  return normalizePathname(new URL(getFinalUrl(page)).pathname);
-}
-
-function round2(value: number): number {
-  return Number(value.toFixed(2));
-}
-
-function pageScore(page: EnrichedPage): number {
-  const wordCount = page.contentSignals?.wordCount || 0;
-  const mainContentWordCount = page.contentSignals?.mainContentWordCount || 0;
-  const images = page.contentSignals?.imageCount || 0;
-  const links = page.contentSignals?.internalLinksCount || 0;
-  const confidence = page.pageTypeConfidence || page.confidence || 0;
-
-  return round2(confidence * 100 + mainContentWordCount * 0.18 + wordCount * 0.06 + images * 5 + links * 0.8);
-}
-
-function sortCandidates(pages: EnrichedPage[]): EnrichedPage[] {
-  return [...pages].sort((a, b) => pageScore(b) - pageScore(a) || getFinalUrl(a).localeCompare(getFinalUrl(b)));
-}
-
-function readSelectionCandidate(page: EnrichedPage, selectionReason: string): SelectedPage {
-  const finalUrl = normalizeUrl(getFinalUrl(page));
+function createEmptyDomSnapshot(): DomSnapshotResult {
   return {
-    url: normalizeUrl(page.url),
-    finalUrl,
-    normalizedPath: getNormalizedPath(page),
-    title: page.title || null,
-    pageType: page.pageType,
-    siteRole: page.siteRole,
-    cluster: page.cluster,
-    businessValue: page.businessValue,
-    selectionReason,
+    layoutBlocks: [],
+    keyElements: {},
+    typography: {
+      uniqueFontFamilies: [],
+      fontFamilyUsage: [],
+      commonHeadingSizes: [],
+      commonParagraphSizes: [],
+      fontWeightPatterns: [],
+    },
+    colors: {
+      text: [],
+      backgrounds: [],
+      buttons: [],
+      accents: [],
+      borders: [],
+    },
+    media: {
+      images: {
+        count: 0,
+        lazyHints: 0,
+        examples: [],
+      },
+      backgroundImages: {
+        count: 0,
+        examples: [],
+      },
+      svgCount: 0,
+      videoCount: 0,
+      canvasCount: 0,
+      iframeCount: 0,
+      iconHintsCount: 0,
+    },
+    positioning: {
+      stickyElements: [],
+      fixedElements: [],
+      overlayLikeElements: [],
+      modalLikeElements: [],
+      drawerLikeElements: [],
+    },
+    motionClues: {
+      transitionElements: 0,
+      animationElements: 0,
+      transformElements: 0,
+      opacityVariantElements: 0,
+      willChangeElements: 0,
+      filterElements: 0,
+      backdropFilterElements: 0,
+      samples: [],
+    },
+    visualHierarchy: {
+      dominantHeadingBlock: null,
+      primaryCta: null,
+      visibleMajorSections: 0,
+      aboveFoldHeadingCount: 0,
+      aboveFoldButtonCount: 0,
+      aboveFoldParagraphCount: 0,
+      aboveFoldMediaCount: 0,
+      firstViewportProfile: "balanced",
+      emphasis: "mixed",
+    },
+    visualSystem: {
+      spacingScale: [],
+      containerWidths: [],
+      borderRadiusPatterns: [],
+      shadowPatterns: [],
+      buttonStylePatterns: [],
+      typographyScale: [],
+      visualDensity: "balanced",
+    },
   };
-}
-
-function addSelectedPage(
-  map: Map<string, SelectedPage>,
-  page: EnrichedPage | undefined,
-  selectionReason: string,
-): void {
-  if (!page || page.fetchStatus !== "ok") return;
-  const key = normalizeUrl(getFinalUrl(page));
-  if (!map.has(key)) {
-    map.set(key, readSelectionCandidate(page, selectionReason));
-  }
-}
-
-function pickExactPath(pages: EnrichedPage[], wantedPath: string): EnrichedPage | undefined {
-  return pages.find(page => getNormalizedPath(page) === wantedPath && page.fetchStatus === "ok");
-}
-
-function countSelectedByType(selected: Iterable<SelectedPage>, pageType: PageType): number {
-  let count = 0;
-  for (const page of selected) {
-    if (page.pageType === pageType) count += 1;
-  }
-  return count;
-}
-
-function selectVisualAuditPages(source: Stage3Output): SelectedPage[] {
-  const pages = source.pages.filter(page => page.fetchStatus === "ok");
-  const selected = new Map<string, SelectedPage>();
-
-  for (const wantedPath of EXACT_PATHS) {
-    addSelectedPage(selected, pickExactPath(pages, wantedPath), `core path ${wantedPath}`);
-  }
-
-  const categoryCandidates = sortCandidates(
-    pages.filter(page => page.pageType === "category" && page.shouldAnalyze && page.businessValue === "high"),
-  );
-
-  for (const page of categoryCandidates.slice(0, MAX_CATEGORY_PAGES)) {
-    addSelectedPage(selected, page, "representative category page");
-  }
-
-  const detailCandidates = sortCandidates(
-    pages.filter(
-      page =>
-        page.pageType === "detail" &&
-        page.shouldAnalyze &&
-        getNormalizedPath(page).startsWith("/quote/"),
-    ),
-  );
-
-  const detailsByParent = new Set<string>();
-  for (const page of detailCandidates) {
-    if (countSelectedByType(selected.values(), "detail") >= MAX_DETAIL_PAGES) break;
-    const parentKey = page.parentCandidate || "__no-parent__";
-    if (detailsByParent.has(parentKey) && detailsByParent.size >= 2) continue;
-    addSelectedPage(
-      selected,
-      page,
-      page.parentCandidate ? "representative quote page by parent cluster" : "representative quote page",
-    );
-    detailsByParent.add(parentKey);
-  }
-
-  for (const page of detailCandidates) {
-    if (countSelectedByType(selected.values(), "detail") >= MAX_DETAIL_PAGES) break;
-    addSelectedPage(selected, page, "representative quote page");
-  }
-
-  let output = [...selected.values()];
-  if (URL_FILTER) {
-    output = output.filter(page => page.finalUrl.toLowerCase().includes(URL_FILTER));
-  }
-  if (MAX_SELECTED_PAGES > 0) {
-    output = output.slice(0, MAX_SELECTED_PAGES);
-  }
-
-  return output;
 }
 
 async function readStage3Output(filePath: string): Promise<Stage3Output> {
   const content = await fs.readFile(filePath, "utf-8");
   const parsed = JSON.parse(content) as Stage3Output;
-
   if (!parsed || !Array.isArray(parsed.pages)) {
-    throw new Error("Invalid format in output/03-enriched-site-data.json");
+    throw new Error(`Invalid format in ${filePath}`);
   }
-
   return parsed;
 }
 
@@ -266,70 +116,236 @@ async function writeJson(filePath: string, value: unknown): Promise<void> {
   await fs.writeFile(filePath, JSON.stringify(value, null, 2), "utf-8");
 }
 
-async function main(): Promise<void> {
-  const sourcePath = path.resolve(SOURCE_FILE_REL);
-  const outputPath = path.resolve(OUTPUT_FILE_REL);
-  const screenshotsDir = path.resolve(SCREENSHOTS_DIR_REL);
+async function writeText(filePath: string, value: string): Promise<void> {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, value, "utf-8");
+}
 
-  const source = await readStage3Output(sourcePath);
-  const selectedPages = selectVisualAuditPages(source);
+async function auditViewport(
+  browser: Browser,
+  selectedPage: SelectedPage,
+  viewportPreset: ReturnType<typeof buildAuditViewports>[number],
+  config: Stage5Config,
+): Promise<BrowserViewportAudit> {
+  const warnings: AuditNotice[] = [];
+  const errors: AuditNotice[] = [];
+  const domSnapshot = createEmptyDomSnapshot();
+  const artifactPaths = buildViewportArtifactPaths(
+    config,
+    selectedPage.finalUrl,
+    viewportPreset.name,
+    selectedPage.pageType,
+  );
+
+  let pagePreparationNotes: string[] = [];
+  let obstructionsDetected: BrowserViewportAudit["obstructionsDetected"] = [];
+  let title: string | null = selectedPage.title;
+  let finalUrl = selectedPage.finalUrl;
+  let pageLoadStatus: BrowserViewportAudit["pageLoadStatus"] = "ok";
+  let statusCode: number | null = null;
+  let timings: BrowserViewportAudit["timings"] = null;
+  let renderedHtmlPath: string | null = null;
+  let screenshots: BrowserViewportAudit["screenshots"] = {
+    full: null,
+    viewport: null,
+  };
+
+  let context = null;
+
+  try {
+    context = await createAuditContext(browser, viewportPreset, config);
+    await installDomSnapshotRuntime(context);
+    const page = await createAuditPage(context, config);
+
+    const preparation = await preparePageForAudit(page, selectedPage.finalUrl, config);
+    pagePreparationNotes = preparation.notes;
+    obstructionsDetected = preparation.obstructionsDetected;
+    warnings.push(...preparation.warnings);
+    errors.push(...preparation.errors);
+    title = preparation.title;
+    finalUrl = preparation.finalUrl || selectedPage.finalUrl;
+    pageLoadStatus = preparation.pageLoadStatus;
+    statusCode = preparation.statusCode;
+
+    try {
+      timings = await collectLoadTimingSummary(page);
+      if (!timings) {
+        pushNotice(warnings, "LOAD_TIMINGS_UNAVAILABLE", "Navigation timing summary was not available.");
+      }
+    } catch (error) {
+      pushNotice(
+        warnings,
+        "LOAD_TIMINGS_FAILED",
+        error instanceof Error ? error.message : "Failed to collect load timing summary.",
+      );
+    }
+
+    let snapshot = domSnapshot;
+    try {
+      snapshot = await collectDomSnapshot(page);
+    } catch (error) {
+      pushNotice(
+        errors,
+        "DOM_SNAPSHOT_FAILED",
+        error instanceof Error ? error.message : "DOM snapshot collection failed.",
+      );
+      pageLoadStatus = pageLoadStatus === "ok" ? "partial" : pageLoadStatus;
+    }
+
+    try {
+      renderedHtmlPath = (await saveRenderedHtml(page, artifactPaths, config))?.path || null;
+    } catch (error) {
+      pushNotice(
+        warnings,
+        "RENDERED_HTML_FAILED",
+        error instanceof Error ? error.message : "Rendered HTML export failed.",
+      );
+    }
+
+    try {
+      screenshots = await saveAuditScreenshots(page, artifactPaths, config);
+    } catch (error) {
+      pushNotice(
+        warnings,
+        "SCREENSHOT_FAILED",
+        error instanceof Error ? error.message : "Screenshot capture failed.",
+      );
+      pageLoadStatus = pageLoadStatus === "ok" ? "partial" : pageLoadStatus;
+    }
+
+    return {
+      viewport: viewportPreset.viewport,
+      title,
+      finalUrl,
+      pageLoadStatus,
+      statusCode,
+      warnings,
+      errors,
+      timings,
+      pagePreparationNotes,
+      obstructionsDetected,
+      renderedHtmlPath,
+      screenshots,
+      layoutBlocks: snapshot.layoutBlocks,
+      keyElements: snapshot.keyElements,
+      typography: snapshot.typography,
+      colors: snapshot.colors,
+      media: snapshot.media,
+      positioning: snapshot.positioning,
+      motionClues: snapshot.motionClues,
+      visualHierarchy: snapshot.visualHierarchy,
+      visualSystem: snapshot.visualSystem,
+    };
+  } catch (error) {
+    pushNotice(
+      errors,
+      "VIEWPORT_AUDIT_FAILED",
+      error instanceof Error ? error.message : "Viewport audit failed before completion.",
+    );
+
+    return {
+      viewport: viewportPreset.viewport,
+      title,
+      finalUrl,
+      pageLoadStatus: "error",
+      statusCode,
+      warnings,
+      errors,
+      timings,
+      pagePreparationNotes,
+      obstructionsDetected,
+      renderedHtmlPath,
+      screenshots,
+      layoutBlocks: domSnapshot.layoutBlocks,
+      keyElements: domSnapshot.keyElements,
+      typography: domSnapshot.typography,
+      colors: domSnapshot.colors,
+      media: domSnapshot.media,
+      positioning: domSnapshot.positioning,
+      motionClues: domSnapshot.motionClues,
+      visualHierarchy: domSnapshot.visualHierarchy,
+      visualSystem: domSnapshot.visualSystem,
+    };
+  } finally {
+    await context?.close().catch(() => undefined);
+  }
+}
+
+async function auditSelectedPage(
+  browser: Browser,
+  selectedPage: SelectedPage,
+  config: Stage5Config,
+): Promise<Stage5OutputPage> {
+  const viewportPresets = buildAuditViewports(config);
+  const audits = {} as Stage5OutputPage["audits"];
+
+  for (const viewportPreset of viewportPresets) {
+    console.log(`[stage5]    -> ${viewportPreset.name}`);
+    audits[viewportPreset.name] = await auditViewport(browser, selectedPage, viewportPreset, config);
+  }
+
+  return {
+    ...selectedPage,
+    audits,
+  };
+}
+
+async function main(): Promise<void> {
+  const config = getStage5ConfigFromEnv();
+  const source = await readStage3Output(config.inputFile);
+  const selectedPages = selectVisualAuditPages(source, config);
 
   if (!selectedPages.length) {
     throw new Error("No pages selected for visual audit.");
   }
 
   console.log(`[stage5] Starting Stage 5 visual audit for ${selectedPages.length} pages.`);
-  console.log(`[stage5] Source: ${sourcePath}`);
-  console.log(`[stage5] Screenshots: ${screenshotsDir}`);
+  console.log(`[stage5] Source: ${config.inputFile}`);
+  console.log(`[stage5] Screenshots: ${config.screenshotsDir}`);
+  console.log(`[stage5] Rendered HTML: ${config.renderedHtmlDir}`);
 
-  const browser = await launchAuditBrowser();
+  const browser = await launchAuditBrowser(config);
 
   try {
-    const auditedPages: Stage5OutputPage[] = [];
-
+    const pages: Stage5OutputPage[] = [];
     for (let index = 0; index < selectedPages.length; index += 1) {
       const selectedPage = selectedPages[index];
       console.log(
-        `[stage5] [${index + 1}/${selectedPages.length}] ${selectedPage.finalUrl} (${selectedPage.pageType}, ${selectedPage.selectionReason})`,
+        `[stage5] [${index + 1}/${selectedPages.length}] ${selectedPage.finalUrl} (${selectedPage.archetype})`,
       );
-
-      const audits: Record<string, BrowserViewportAudit> = {};
-      for (const preset of AUDIT_VIEWPORTS) {
-        console.log(`[stage5]    -> ${preset.name}`);
-        audits[preset.name] = await runViewportVisualAudit({
-          browser,
-          preset,
-          url: selectedPage.finalUrl,
-          screenshotsDir,
-          pageType: selectedPage.pageType,
-        });
-      }
-
-      auditedPages.push({
-        ...selectedPage,
-        audits,
-      });
+      pages.push(await auditSelectedPage(browser, selectedPage, config));
     }
 
     const output: Stage5Output = {
+      auditVersion: config.auditVersion,
       generatedAt: new Date().toISOString(),
-      sourceFile: SOURCE_FILE_REL,
+      sourceFile: toRelativeOutputPath(config.inputFile),
       sourceGeneratedAt: source.generatedAt,
-      screenshotsDir: SCREENSHOTS_DIR_REL.replace(/\\/g, "/"),
-      pagesAudited: auditedPages.length,
-      auditVariants: auditedPages.length * AUDIT_VIEWPORTS.length,
-      pages: auditedPages,
+      config: toPublicStage5Config({
+        ...config,
+        inputFile: toRelativeOutputPath(config.inputFile),
+        outputJsonFile: toRelativeOutputPath(config.outputJsonFile),
+        outputSummaryFile: toRelativeOutputPath(config.outputSummaryFile),
+        screenshotsDir: toRelativeOutputPath(config.screenshotsDir),
+        renderedHtmlDir: toRelativeOutputPath(config.renderedHtmlDir),
+      }),
+      screenshotsDir: toRelativeOutputPath(config.screenshotsDir),
+      renderedHtmlDir: toRelativeOutputPath(config.renderedHtmlDir),
+      pagesAudited: pages.length,
+      auditVariants: pages.length * buildAuditViewports(config).length,
+      pages,
     };
 
-    await writeJson(outputPath, output);
+    await writeJson(config.outputJsonFile, output);
+    await writeText(config.outputSummaryFile, buildVisualAuditMarkdownSummary(output));
 
     console.log("[stage5] Stage 5 completed.");
-    console.log(`[stage5] Output: ${outputPath}`);
+    console.log(`[stage5] JSON: ${config.outputJsonFile}`);
+    console.log(`[stage5] Summary: ${config.outputSummaryFile}`);
     console.log(`[stage5] Pages audited: ${output.pagesAudited}`);
     console.log(`[stage5] Audit variants: ${output.auditVariants}`);
-    console.log(
-      `[stage5] Page slugs: ${auditedPages.map(page => createPageSlug(page.finalUrl, page.pageType)).join(", ")}`,
-    );
+    console.log(`[stage5] Page slugs: ${pages.map(page => createPageSlug(page.finalUrl, page.pageType)).join(", ")}`);
+    console.log("[stage5] Run via: npm run stage:05");
   } finally {
     await browser.close();
   }

@@ -7,7 +7,8 @@
     "stage2": "tsx src/extract-page-data.ts",
     "stage3": "tsx src/validate-site-structure.ts",
     "stage4": "tsx src/run-stage-04-analysis.ts",
-    "stage5": "tsx src/stages/05-audit-visual.ts"
+    "stage5": "tsx src/stages/05-audit-visual.ts",
+    "stage:05": "tsx src/stages/05-audit-visual.ts"
   },
   "dependencies": {
     "axios": "^1.8.4",
