@@ -6,7 +6,8 @@
     "stage1": "tsx src/crawl.ts",
     "stage2": "tsx src/extract-page-data.ts",
     "stage3": "tsx src/validate-site-structure.ts",
-    "stage4": "tsx src/run-stage-04-analysis.ts"
+    "stage4": "tsx src/run-stage-04-analysis.ts",
+    "stage5": "tsx src/stages/05-audit-visual.ts"
   },
   "dependencies": {
     "axios": "^1.8.4",
@@ -18,6 +19,7 @@
     "@openai/codex": "^0.114.0",
     "@types/node": "^22.19.15",
     "@types/xml2js": "^0.4.14",
+    "playwright": "^1.58.2",
     "tsx": "^4.19.3",
     "typescript": "^5.8.2"
   }
